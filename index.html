@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historical Capture Tool with Slider</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: black;
+            color: white;
+            font-family: sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            user-select: none; /* テキスト選択防止 */
+        }
+
+        /* 案内テキスト */
+        #instruction {
+            font-size: 24px;
+            pointer-events: none;
+            transition: opacity 0.5s;
+            z-index: 5;
+        }
+
+        /* 映像表示要素 */
+        video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
+            pointer-events: none;
+        }
+
+        /* REC表示エリア */
+        #rec-indicator {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 20px;
+            font-weight: bold;
+            display: none;
+            align-items: center;
+            gap: 10px;
+            z-index: 10;
+        }
+
+        /* 赤丸の点滅 */
+        .red-dot {
+            width: 15px;
+            height: 15px;
+            background-color: red;
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0; }
+            100% { opacity: 1; }
+        }
+
+        /* 一時停止マーク */
+        #pause-icon {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            font-size: 40px;
+            display: none;
+            z-index: 10;
+            text-shadow: 0 0 5px black;
+        }
+
+        /* スライダコントローラー */
+        #controls-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 20; /* クリックできるように最前面へ */
+            cursor: default; /* ここだけは通常のカーソル */
+        }
+
+        #delay-label {
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+
+        input[type=range] {
+            width: 200px;
+            cursor: pointer;
+        }
+        
+        /* 録画中はスライダを無効化するスタイル */
+        input[type=range]:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="instruction">アクセスを許可してください</div>
+    
+    <div id="rec-indicator">
+        <div class="red-dot"></div>
+        <span>REC</span>
+    </div>
+
+    <div id="pause-icon">⏸</div>
+
+    <div id="controls-container" onclick="event.stopPropagation()"> <div id="delay-label">遅延設定: <span id="delay-value">30</span>秒</div>
+        <input type="range" id="delay-slider" min="5" max="45" step="1" value="30">
+    </div>
+
+    <video id="history-video" muted playsinline></video>
+
+    <script>
+        const instruction = document.getElementById('instruction');
+        const recIndicator = document.getElementById('rec-indicator');
+        const pauseIcon = document.getElementById('pause-icon');
+        const video = document.getElementById('history-video');
+        const delaySlider = document.getElementById('delay-slider');
+        const delayValueSpan = document.getElementById('delay-value');
+        
+        let stream = null;
+        let mediaRecorder = null;
+        let mediaSource = null;
+        let sourceBuffer = null;
+        
+        let isRecording = false;       // 録画プロセスが開始しているか
+        let isPlaybackStarted = false; // 遅延後の再生が始まっているか
+        let isPaused = false;          // 一時停止中か
+        
+        let delaySeconds = 30;         // 初期値
+        
+        const bufferQueue = [];
+
+        // スライダのイベントリスナー
+        delaySlider.addEventListener('input', (e) => {
+            delaySeconds = parseInt(e.target.value, 10);
+            delayValueSpan.textContent = delaySeconds;
+        });
+
+        // 画面全体のクリックイベント
+        document.body.addEventListener('click', handleClick);
+
+        async function handleClick() {
+            // まだ録画が始まっていない場合（初期状態）
+            if (!isRecording) {
+                try {
+                    // 画面キャプチャの要求
+                    stream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { cursor: "always" },
+                        audio: false
+                    });
+
+                    // ユーザーがブラウザの共有停止ボタンを押した時の処理
+                    stream.getVideoTracks()[0].onended = () => {
+                        location.reload();
+                    };
+
+                    startRecordingProcess();
+
+                } catch (err) {
+                    // キャンセル時などは何もしない
+                    console.log("Access denied or cancelled.");
+                }
+                return;
+            }
+
+            // 録画中で、かつ遅延時間が経過して再生が始まっている場合のみ一時停止操作が可能
+            if (isPlaybackStarted) {
+                togglePause();
+            }
+        }
+
+        function startRecordingProcess() {
+            isRecording = true;
+            
+            // UI更新
+            instruction.style.display = 'none';
+            recIndicator.style.display = 'flex';
+            
+            // スライダをロック（録画開始後は変更不可）
+            delaySlider.disabled = true;
+            delayValueSpan.textContent += " (ロック中)";
+
+            // MediaSourceのセットアップ
+            mediaSource = new MediaSource();
+            video.src = URL.createObjectURL(mediaSource);
+
+            mediaSource.addEventListener('sourceopen', () => {
+                const mimeType = 'video/webm; codecs="vp8"'; // または vp9
+                
+                try {
+                    sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+                    sourceBuffer.addEventListener('updateend', processBufferQueue);
+                } catch (e) {
+                    console.error("Codec not supported", e);
+                    alert("ブラウザがVP8コーデックをサポートしていないようです。");
+                    return;
+                }
+
+                mediaRecorder = new MediaRecorder(stream, { mimeType: mimeType });
+                
+                mediaRecorder.ondataavailable = async (event) => {
+                    if (event.data && event.data.size > 0) {
+                        const buffer = await event.data.arrayBuffer();
+                        bufferQueue.push(buffer);
+                        processBufferQueue();
+                    }
+                };
+
+                mediaRecorder.start(100); // 100msごとにチャンク生成
+
+                // 設定された秒数後に再生開始
+                console.log(`Recording started. Playback will start in ${delaySeconds} seconds.`);
+                setTimeout(() => {
+                    startPlayback();
+                }, delaySeconds * 1000);
+            });
+        }
+
+        function processBufferQueue() {
+            if (sourceBuffer && !sourceBuffer.updating && bufferQueue.length > 0) {
+                const chunk = bufferQueue.shift();
+                try {
+                    sourceBuffer.appendBuffer(chunk);
+                } catch (e) {
+                    console.error("Buffer append error", e);
+                }
+            }
+        }
+
+        function startPlayback() {
+            isPlaybackStarted = true;
+            video.style.display = 'block';
+            video.play().catch(e => console.log("Play error:", e));
+        }
+
+        function togglePause() {
+            if (isPaused) {
+                // 再開
+                isPaused = false;
+                pauseIcon.style.display = 'none';
+                
+                if (mediaRecorder.state === 'paused') {
+                    mediaRecorder.resume();
+                }
+                video.play();
+
+            } else {
+                // 一時停止
+                isPaused = true;
+                pauseIcon.style.display = 'block';
+
+                if (mediaRecorder.state === 'recording') {
+                    mediaRecorder.pause();
+                }
+                video.pause();
+            }
+        }
+    </script>
+</body>
+</html>
